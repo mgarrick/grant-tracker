@@ -4,16 +4,21 @@ import sys
 import pandas as pd
 import docx.oxml.ns as ns
 from docx import Document
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
 import re
+import html
 from docx.shared import RGBColor, Pt
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-import docx.oxml as oxml
-import openai
+from openai import AzureOpenAI
 from datetime import datetime
 
 from pandas import NaT
+import argparse
 
 API_KEY_FILE = 'apikey.txt'
+FEW_SHOT_EXAMPLES_CSV = 'extra/few_shot_examples.csv'
+
 
 # 1. read csv file
 def read_csv_file(file_path):
@@ -21,7 +26,7 @@ def read_csv_file(file_path):
         # Read the CSV file into a DataFrame
         df = pd.read_csv(file_path)
         # Keep only the specified fields (columns)
-        fields = ["Title", "Funder", "Deadline", "Amount", "Eligibility", "Abstract", "More Information"]
+        fields = ["Title", "Funder", "Deadline", "Amount", "Eligibility", "Career Stage", "Abstract", "More Information"]
         filtered_df = df[fields]
         # remove html tag in each cell
         filtered_df = filtered_df.map(remove_html_tag)
@@ -40,12 +45,18 @@ def read_csv_file(file_path):
 def remove_html_tag(value):
     if not isinstance(value, str):
         value = str(value)
+
+    # Unescape HTML entities like &nbsp;, &amp;, etc.
+    value = html.unescape(value)
+
+    # Remove HTML tags
     value = re.sub(r"<[^>]*>", "", value)
+
     return value
 
+
 # 2. convert csv file to word file and format word file
-def format_word_file(data_frame, head_title):
-    get_api_key()
+def format_word_file(llm, data_frame, head_title):
 
     # Create a new Word document for the formatted content
     formatted_doc = Document()
@@ -70,8 +81,6 @@ def format_word_file(data_frame, head_title):
         title_text = f"{row['Funder']} | {row['Title']}"
         if row['More Information']:
             hyperlink_run = add_hyperlink(p, row['More Information'], title_text)
-            hyperlink_run.font.color.rgb = RGBColor(0, 0, 255)
-            hyperlink_run.bold = True
             p.add_run("\n")
         else:
             title_run = p.add_run(title_text)
@@ -97,8 +106,8 @@ def format_word_file(data_frame, head_title):
             amount = row['Amount']
             print(f'Summarizing amount: {amount}')
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",  # Specify the chat model
+                response = llm.chat.completions.create(
+                    model="gpt-4o",  # Specify the chat model
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant who's good at summarization."},
                         {"role": "user", "content": f"Summarize the following text by extracting award amount in"
@@ -109,7 +118,7 @@ def format_word_file(data_frame, head_title):
                     temperature=0.7  # Adjusts randomness in the response. Lower is more deterministic.
                 )
                 # The response format is different for chat completions
-                summary = response['choices'][0]['message']['content'].strip()
+                summary = response.choices[0].message.content.strip()
                 print(f'Summarized amount: {summary}')
             except Exception as e:
                 print(f"API call failed for amount: {e}")
@@ -120,30 +129,33 @@ def format_word_file(data_frame, head_title):
 
         # Eligibility
         if row['Eligibility']:
-            eligibility = row['Eligibility']
+            eligibility = format_eligibility(row['Eligibility'], row['Career Stage'])
             print(f'Summarizing eligibility: {eligibility}')
+
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",  # Specify the chat model
-                    messages=[
-                        {"role": "system", "content": "You are a helpful assistant who's good at summarization."},
-                        {"role": "user", "content": f"Summarize the following text by extracting which level "
-                                                f"of faculty is eligible. If the level is not mentioned, "
-                                                f"simply return Any level faculty"
-                                                f"Also include information if this requires MD or PhD if the "
-                                                f"information is available. Include the tenure information "
-                                                    f"as well."
-                                                    f" Don’t add any prefix like ‘Eligible faculty level:’."
-                                                    f"Do not include any notes or explanations. And do not say things like:"
-                                                    f"'MD or PhD is not mentioned. Tenure information is not provided.'"
-                                                    f"Please be concise: "
-                                                
-                                                f" \n\n{eligibility}"}
-                    ],
-                    max_tokens=150,  # Set the maximum length for the summary
+                messages=[{"role": "system", "content": "You are a helpful, pattern-following assistant that summarizes grant funding opportunities into simple and concise language for UC Irvine faculty.."}]
+
+                # Read the CSV file into a DataFrame
+                fse_df = pd.read_csv(FEW_SHOT_EXAMPLES_CSV)
+
+                # Loop over each few-shot example row
+                for index, fse_row in fse_df.iterrows():
+                    example = format_eligibility(fse_row['Eligibility'], fse_row['Career Stage'])
+                    edited = fse_row['Edited']
+
+                    messages.append({"role": "system", "name": "example_user", "content": example})
+                    messages.append({"role": "system", "name": "example_assistant", "content": edited})
+
+                # Finally, ask to summarize this grant opportunity
+                messages.append({"role": "user", "content": eligibility})
+
+                response = llm.chat.completions.create(
+                    model="gpt-4o",  # Specify the chat model
+                    messages=messages,
+                    max_tokens=200,  # Set the maximum length for the summary
                     temperature=0.7  # Adjusts randomness in the response. Lower is more deterministic.
                 )
-                summary = response['choices'][0]['message']['content'].strip()
+                summary = response.choices[0].message.content.strip()
                 print(f'Summarized eligibility: {summary}')
             except Exception as e:
                 print(f"API call failed for Eligibility: {e}")
@@ -158,8 +170,8 @@ def format_word_file(data_frame, head_title):
             abstract = row['Abstract']
             print(f'Summarizing abstract: {abstract}')
             try:
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",  # Specify the chat model
+                response = llm.chat.completions.create(
+                    model="gpt-4o",  # Specify the chat model
                     messages=[
                         {"role": "system", "content": "You are a helpful assistant who's good at summarization."},
                         {"role": "user", "content": f"Summarize the following text in a concise way."
@@ -171,7 +183,7 @@ def format_word_file(data_frame, head_title):
                     temperature=0.7  # Adjusts randomness in the response. Lower is more deterministic.
                 )
                 # The response format is different for chat completions
-                summary = response['choices'][0]['message']['content'].strip()
+                summary = response.choices[0].message.content.strip()
                 print(f'Summarized abstract: {summary}')
             except Exception as e:
                 print(f"API call failed for Abstract: {e}")
@@ -194,19 +206,42 @@ def add_hyperlink(paragraph, url, text):
     part = paragraph.part
     r_id = part.relate_to(url, 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink', is_external=True)
 
-    hyperlink = oxml.OxmlElement('w:hyperlink')
-    hyperlink.set(oxml.ns.qn('r:id'), r_id)
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('r:id'), r_id)
 
-    new_run = oxml.OxmlElement('w:r')
-    rPr = oxml.OxmlElement('w:rPr')
+    # Create a new run for the hyperlink
+    new_run = OxmlElement('w:r')
+    rPr = OxmlElement('w:rPr')
+    # Optionally, set the formatting (e.g., blue and underlined)
+    rStyle = OxmlElement('w:rStyle')
+    rStyle.set(qn('w:val'), 'Hyperlink')
+    rPr.append(rStyle)
+
+    # Create elements for color and bold
+    color = OxmlElement('w:color')
+    color.set(qn('w:val'), '0000FF')  # Blue color
+    rPr.append(color)
+
+    bold = OxmlElement('w:b')
+    bold.set(qn('w:val'), 'true')
+    rPr.append(bold)
+
     new_run.append(rPr)
-    new_run.text = text
+
+    # Add text to the run
+    text_element = OxmlElement('w:t')
+    text_element.text = text
+    new_run.append(text_element)
+
+    # Append the run to the hyperlink element
     hyperlink.append(new_run)
 
-    r = paragraph.add_run()
-    r._r.append(hyperlink)
+    # Add the hyperlink element to the paragraph
+    paragraph._element.append(hyperlink)
 
-    return r
+    # Create a run object and return it
+    return paragraph.add_run()
+
 
 def extract_closest_future_date(deadline_txt):
     if deadline_txt:
@@ -226,7 +261,7 @@ def resource_path(relative_path):
 
 def get_api_key():
     with open(resource_path(API_KEY_FILE), 'r') as file:
-        openai.api_key = file.read().strip()
+        return file.read().strip()
 
 def unify_line_endings(file_path):
     with open(file_path, 'r', encoding='utf-8', newline=None) as file:
@@ -235,20 +270,52 @@ def unify_line_endings(file_path):
     with open(file_path, 'w', encoding='utf-8', newline='\n') as file:
         file.write(content)
         
-def file_process(file_path, head_title):
+def file_process(llm, file_path, head_title):
     unify_line_endings(file_path)
     # 1. read csv file
     data_frame = read_csv_file(file_path)
     # 2. convert csv file to word file and format word file
     if data_frame is not None:
-        formatted_doc = format_word_file(data_frame, head_title)
+        formatted_doc = format_word_file(llm, data_frame, head_title)
         return formatted_doc
     else:
         raise ValueError("No data found in the file")
 
+def format_eligibility(eligibility, career_stage):
+    return eligibility + "\nCareer Stage: " + career_stage
+
 if __name__ == "__main__":
-    file_path = "sample_data/opps_export.csv"
-    formatted_word_file_path = "output_word/formattedOutput.docx"
-    head_title = "test"
-    formatted_doc = file_process(file_path, head_title)
-    save_file(formatted_doc, formatted_word_file_path)
+    parser = argparse.ArgumentParser(description="Process CSV (file or STDIN).")
+    parser.add_argument('filename', help="Name of the .csv file to process")
+    parser.add_argument('-o', '--output', help="Name of the output file to save the results")
+    parser.add_argument('--head', help="The heading title for the document")
+
+    args = parser.parse_args()
+
+    # Default to input filename without .csv if output not provided
+    if args.output:
+        output_filename = args.output
+    else:
+        if args.filename.endswith(".csv"):
+            output_filename = args.filename[:-4] + ".docx"
+        else:
+            output_filename = args.filename + ".docx"
+
+    # Default the head (heading) to input filename without .csv and title-cased if not provided
+    if args.head:
+        head_title = args.head
+    else:
+        base_name = os.path.basename(args.filename)
+        if base_name.endswith(".csv"):
+            base_name = base_name[:-4]
+        head_title = base_name.replace('_', ' ').title()  # Convert underscores to spaces and title-case it
+
+    llm = AzureOpenAI(
+        api_key=get_api_key(),
+        api_version="2024-02-01",
+        azure_endpoint="https://azureapi.zotgpt.uci.edu/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
+    )
+
+    # Process the file and save the results
+    formatted_doc = file_process(llm, args.filename, head_title)
+    save_file(formatted_doc, output_filename)
