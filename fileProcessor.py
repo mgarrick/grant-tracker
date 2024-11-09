@@ -46,6 +46,10 @@ def remove_html_tag(value):
     if not isinstance(value, str):
         value = str(value)
 
+    # First unescape &amp;.  For some reason the source data
+    # double escapes these.
+    value = re.sub(r'&amp;', '&', value)
+
     # Unescape HTML entities like &nbsp;, &amp;, etc.
     value = html.unescape(value)
 
@@ -56,7 +60,12 @@ def remove_html_tag(value):
 
 
 # 2. convert csv file to word file and format word file
-def format_word_file(llm, data_frame, head_title):
+def format_word_file(data_frame, head_title):
+    llm = AzureOpenAI(
+        api_key=get_api_key(),
+        api_version="2024-02-01",
+        azure_endpoint="https://azureapi.zotgpt.uci.edu/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
+    )
 
     # Create a new Word document for the formatted content
     formatted_doc = Document()
@@ -269,14 +278,14 @@ def unify_line_endings(file_path):
 
     with open(file_path, 'w', encoding='utf-8', newline='\n') as file:
         file.write(content)
-        
-def file_process(llm, file_path, head_title):
+
+def file_process(file_path, head_title):
     unify_line_endings(file_path)
     # 1. read csv file
     data_frame = read_csv_file(file_path)
     # 2. convert csv file to word file and format word file
     if data_frame is not None:
-        formatted_doc = format_word_file(llm, data_frame, head_title)
+        formatted_doc = format_word_file(data_frame, head_title)
         return formatted_doc
     else:
         raise ValueError("No data found in the file")
@@ -310,12 +319,6 @@ if __name__ == "__main__":
             base_name = base_name[:-4]
         head_title = base_name.replace('_', ' ').title()  # Convert underscores to spaces and title-case it
 
-    llm = AzureOpenAI(
-        api_key=get_api_key(),
-        api_version="2024-02-01",
-        azure_endpoint="https://azureapi.zotgpt.uci.edu/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-01"
-    )
-
     # Process the file and save the results
-    formatted_doc = file_process(llm, args.filename, head_title)
+    formatted_doc = file_process(args.filename, head_title)
     save_file(formatted_doc, output_filename)
